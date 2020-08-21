@@ -12,20 +12,15 @@ It contains 2 classes
    CvpError -- Handles exceptions
    CvpService -- Handles requests
 '''
-try:
-   import requests_2_6_0 as requests
-except ImportError:
-   import requests
 import json
 import uuid
 import os
 import errorCodes
 import base64
 import time
-try:
-   from requests_2_6_0.utils import quote
-except ImportError:
-   from requests.utils import quote
+import requests
+import string
+from requests.utils import quote
 
 try:
    # squelch annoying warnings
@@ -36,7 +31,10 @@ except AttributeError:
 DEFAULT_USER = "cvpadmin"
 DEFAULT_PASSWORD = "cvpadmin"
 UNDEF_CONTAINER_KEY = 'undefined_container'
+UNDEF_CONTAINER_NAME = 'Undefined'
 ROOT_CONTAINER_KEY = 'root'
+ONBOARD_DEVICE_BATCH_SIZE = 200
+DEVICE_MOVE_BATCH_SIZE = 200
 trace = ( 'cvpServices' in os.getenv( 'TRACE', '' ).split( ',' ) )
 
 class CvpError( Exception ):
@@ -91,7 +89,6 @@ class CvpService( object ):
       getInventory()
       configAppliedContainers( configletName )
       configAppliedDevices ( configletName )
-      retrieveInventory()
       getImagesInfo()
       addConfiglet( configletName, configletContent )
       addConfigletBuilder( ConfigletBuilder )
@@ -117,6 +114,7 @@ class CvpService( object ):
       deleteContainer(  containerName, containerKey, parentContainerName,
          parentKey )
       deleteDevice( deviceKey, parentContainerName, containerKey )
+      factoryResetDevice( self, containerName, containerKey, deviceFqdn, deviceKey )
       applyConfigToDevice( deviceIpAddress, deviceFqdn, deviceKey,
          configNameList, configKeyList )
       applyConfigToContainer( containerName, containerKey, configNameList,
@@ -142,20 +140,11 @@ class CvpService( object ):
       updateRole( roleName, description, moduleList, roleKey )
       updateConfigletBuilder( ConfigletBuilderName, formList, mainScript,
          configletBuilderId, waitForTaskIds )
-      importDeviceByCsv( filename, strDirPath )
       addTaskLog( taskId, message, src )
       getSnapshotTemplates()
+      deleteSnapshotTemplates( templateList )
       getTemplateInfo( key )
       getTemplatesInfo( keys )
-      getTasksForChangeControl()
-      addOrUpdateChangeControl( ccId, ccmName, snapshotKey, taskInfo,
-         schedule, countryId, stopOnError )
-      deleteChangeControls( ccIds )
-      executeChangeControl( ccIds )
-      cancelChangeControl( ccIds )
-      getChangeControlStatus( ccId , cctaskList)
-      getChangeControls()
-      cloneChangeControl( cc )
       captureDeviceSnapshot()
       scheduleSnapshotTemplate()
       getRollbackDeviceConfigs( deviceId, current, timestamp )
@@ -165,6 +154,8 @@ class CvpService( object ):
       addNetworkRollbackTempActions( containerId, rollbackTime, rollbackType,
                               startIndex, endIndex )
       addNetworkRollbackChangeControl()
+      getLabels( label )
+      getLabelDevInfo( label )
 
    Instance variables:
       port -- Port where Http/Https request made to web server
@@ -232,7 +223,7 @@ class CvpService( object ):
          **kwargs -- multiple arguments passed that need to be handled using name
       Returns:
          response -- Information of the established session
-                     (cookies, session_id etc.)
+                     (cookies, access_token etc.)
       Raises:
          CvpError -- If response contains error code or response is not json
                      If parameter data structures are incorrect
@@ -288,7 +279,7 @@ class CvpService( object ):
                            data=json.dumps( requestPayload ) )
       return validateResponse
 
-   def reconcileContainer( self, containerId ):
+   def reconcileContainer( self, containerId, reconcileAll=False ):
       '''Initiates a reconcile opertion on the container identified by 'containerId'
       Arguments:
          containerId: ID of the container.
@@ -297,7 +288,7 @@ class CvpService( object ):
       '''
       result = self.doRequest( requests.get,
                  '%s/cvpservice/provisioning/containerLevelReconcile.do?containerId=%s'
-                 % ( self.url_, containerId ) )
+                 '&reconcileAll=%s' % ( self.url_, containerId, reconcileAll ) )
       return result
 
    def deviceComplianceCheck( self, deviceMacAddress ):
@@ -346,7 +337,7 @@ class CvpService( object ):
       authentication =  self._authenticationRequest( requests.post,
             '%s/web/login/authenticate.do' % self.url_, data=json.dumps( authData ),
             headers=self.headers )
-      self.cookies[ 'session_id' ] = authentication.cookies[ 'session_id' ]
+      self.cookies[ 'access_token' ] = authentication.cookies[ 'access_token' ]
       # 'role' cookie is mandatory for older releases of CVP i.e. 2015.*
       # and 2016.1.0
       if 'role' in authentication.cookies:
@@ -517,86 +508,6 @@ class CvpService( object ):
                    '%s/web/image/addImage.do' % self.url_, files={ 'file' : f } )
       return imageInfo
 
-   def addTheme( self, themeFilename, themeType, strDirPath='' ):
-      '''Add a theme to Cvp instance
-      Warning -- theme file with theme name as file should exist
-      Argument:
-         themeFilename -- name of the theme ( type : String )
-      Raises:
-         CvpError -- If theme already exists in Cvp instance
-      Returns:
-         themeInfo-- information of theme added to the cvp instance
-      '''
-      assert isinstance( themeFilename, ( str, unicode ) )
-      filePath = ''
-      if strDirPath:
-         filePath = os.path.join( strDirPath, themeFilename )
-      elif self.tmpDir:
-         filePath = os.path.join( self.tmpDir, themeFilename )
-      elif os.path.isfile( themeFilename ):
-         filePath = themeFilename
-      with open( filePath, 'r' ) as f:
-         themeInfo = self.doRequest( requests.post,
-           '%s/web/cvpTheme/addCvpThemes.do?type=%s' % ( self.url_, themeType ),
-           files=[( 'image', ( themeFilename, f, 'image/png' ))] )
-      return themeInfo
-
-   def applyTheme( self, key, themeType ):
-      ''' Apply existing themes to the Cvp instance
-      Arguments:
-         logoKey -- unique key for the logo
-         backgroundImageKey -- unique key for the background image
-      Raises:
-         CvpError -- If parameter data structures are incorrect
-      '''
-      data = { themeType : key }
-      self.doRequest( requests.post, '%s/web/cvpTheme/applyCvpthemes.do'
-                        % self.url_, data=json.dumps( data ) )
-
-   def getThemes( self, storagePath='' ):
-      '''
-      Download all themes
-      Arguments:
-         themeTypes -- list of types ( backgroundImage, logo )
-         storagePath -- path to store the theme files
-      Returns:
-         List of theme names by type with first theme name being active theme
-         ( type :  map of themeTypes => list of theme names )
-      '''
-      themeTypes = [ 'logo', 'backgroundImage' ]
-      themeFilenames = {} # map type => filenames
-      for themeType in themeTypes:
-         themeFilenames[ themeType ] = self.getThemesByType( themeType, storagePath )
-      return themeFilenames
-
-   def getThemesByType( self, themeType, storagePath ):
-      '''
-      Download all themes of specific theme type and get a list of
-      the files. The first file is the active theme file.
-      The files are named as follows:
-         theme_<type>_<startingIndex>.png
-         theme_<type>_<startingIndex + 1>.png
-         ...
-      '''
-      url = '%s/web/cvpTheme/getAllCvpThemes.do?type=%s&startIndex=0&endIndex=0' % \
-            ( self.url_, themeType )
-      themesInfo = self.doRequest( requests.get, url )[
-                   'data' ][ themeType ][ 'data' ]
-      themeFilenames = []
-      index = 0
-      for themeInfo in themesInfo:
-         filepath = os.path.join( storagePath, 'theme_%s_%d.png' % (
-            themeType, index ) )
-         with open( filepath, 'wb' ) as f:
-            f.write( themeInfo[ 'data' ].decode( 'base64' ) )
-         filename = os.path.basename( filepath )
-         if themeInfo[ 'isActive' ]:
-            themeFilenames.append( filename )
-         else:
-            themeFilenames = [ filename ] + themeFilenames
-         index += 1
-      return themeFilenames
-
    def downloadImage( self, imageName, imageId, filePath='' ):
       '''Download the image file from Cvp Instance and stores at corresponding
       file path or current directory
@@ -704,12 +615,6 @@ class CvpService( object ):
                              '&configletId=1'
                              % ( self.url_, name, 0, 0 ) )
       return devices[ 'data' ]
-
-   def retrieveInventory( self ):
-      '''
-      API not valid anymore
-      '''
-      return [], []
 
    def getImagesInfo( self ):
       '''Get information about all the images
@@ -905,10 +810,10 @@ class CvpService( object ):
                'key' : configletKey,
                'reconciled' : True
              }
-      self.doRequest( requests.post,
+      return self.doRequest( requests.post,
                 '%s/web/provisioning/updateReconcileConfiglet.do?netElementId=%s'
                 % ( self.url_, mac ),
-                data=json.dumps( data ) )
+                data=json.dumps( data ) )[ 'data' ]
 
    def deleteConfiglet( self, configletName, configletKey ):
       '''Removes the configlet from Cvp instance
@@ -996,12 +901,17 @@ class CvpService( object ):
             continue
          found = {}
          for device in devicesInfo:
+            hostname = device['hostname']
+            if len(device['domainName']) > 0:
+               suffix = '.' + device['domainName']
+               if hostname.endswith( suffix ):
+                  hostname = hostname[:-len( suffix )]
             if device['ipAddress'] in ipAddressOrNameList:
-               found[ device['ipAddress'] ] = device['serialNumber']
-            elif device['hostname'] in ipAddressOrNameList:
-               found[ device['hostname'] ] = device['serialNumber']
+               found[ device['ipAddress'] ] = device['systemMacAddress']
+            elif hostname in ipAddressOrNameList:
+               found[ hostname ] = device['systemMacAddress']
             elif device['fqdn'] in ipAddressOrNameList:
-               found[ device['fqdn'] ] = device['serialNumber']
+               found[ device['fqdn'] ] = device['systemMacAddress']
          if set(found.keys()) == ipAddressOrNameList:
             return found
          if time.time() > endTime:
@@ -1028,11 +938,11 @@ class CvpService( object ):
       deviceIDMap = self.waitForDevicesToBeInInventory( [ deviceIpAddress ] )
       if parentContainerId == UNDEF_CONTAINER_KEY:
          return None
-      deviceIdToContainerIdMap = { deviceIDMap[ deviceIpAddress ]: parentContainerId }
-      # Map it to desired container
-      mapToContainerResp = self.mapDevicesToContainers( deviceIdToContainerIdMap )
-      assert deviceIDMap[ deviceIpAddress ] in mapToContainerResp[ 'deviceTaskMap' ]
-      return mapToContainerResp[ 'deviceTaskMap' ][ deviceIDMap[deviceIpAddress] ]
+
+      parentContainerName = self.getContainerInfoByKey( parentContainerId )[ 'name' ]
+      deviceMacToContainerNameMap = { deviceIDMap[ deviceIpAddress ]: parentContainerName }
+      moveToContainerResp = self.moveDevicesToContainers( deviceMacToContainerNameMap )
+      return moveToContainerResp[0]
 
    def mapDevicesToContainers( self, deviceIdToContainerIdMap ):
       '''Map devices to containers
@@ -1049,7 +959,77 @@ class CvpService( object ):
                              '%s/cvpservice/inventory/devices/mapToContainer' %
                              self.url_, data=json.dumps( data ) )
 
-   def onboardDevices( self, deviceIpAddressesOrHostnames ):
+   def moveDevicesToContainers( self, deviceMacToContainerNameMap ):
+      '''
+      Move the devices with given mac addresses to the specified containers. It
+      must be noted that the devices will not be moved to the specified
+      containers until after the tasks with IDs returned by this method are
+      executed.
+
+      Arguments:
+         deviceMacToContainerNameMap -- Map of device mac address to container
+            name ( type: map[string]string )
+      Returns:
+         taskIDList -- List of task IDs created
+            ( type: List[string] )
+       '''
+
+      containerInfoList = self.getContainers()
+      containerMap = {}
+      for containerInfo in containerInfoList:
+         containerMap[ containerInfo[ "Name" ] ] = containerInfo[ "Key" ]
+
+      deviceInfoList, _ = self.getInventory(
+              populateParentContainerKeyMap=False )
+      dataList = []
+      for deviceInfo in deviceInfoList:
+         deviceMac = deviceInfo[ "systemMacAddress" ]
+         if deviceMac in deviceMacToContainerNameMap:
+            containerName = deviceMacToContainerNameMap[ deviceMac ]
+            if containerName not in containerMap:
+               raise CvpError( errorCodes.ENTITY_DOES_NOT_EXIST,
+                       errorCodes.ERROR_MAPPING[
+                           errorCodes.ENTITY_DOES_NOT_EXIST ] )
+            info = 'Device Add: %s - To be added to container %s' % (
+                    deviceInfo[ 'fqdn' ], containerName )
+            dataList.append( {
+                "info": info,
+                "infoPreview": info,
+                "action": "update",
+                "nodeType": "netelement",
+                "nodeId": deviceMac,
+                "nodeName": deviceInfo[ "fqdn" ],
+                "fromId": deviceInfo[ "parentContainerKey" ],
+                "toId": containerMap[ containerName ],
+                "toName": containerName,
+                "toIdType": "container" } )
+      if len( dataList ) != len( deviceMacToContainerNameMap ):
+         raise CvpError( errorCodes.ENTITY_DOES_NOT_EXIST,
+                 errorCodes.ERROR_MAPPING[ errorCodes.ENTITY_DOES_NOT_EXIST ] )
+
+      # Call addTempAction, and saveTopology in batch size of 200 to make
+      # sure it completes under 10 minutes which is our nginx proxy timeout.
+      batchSize = DEVICE_MOVE_BATCH_SIZE
+      start, end = 0, len( dataList )
+      taskIds = []
+      while start < end:
+         self._addTempAction({ "data": dataList[ start : min( end, start+batchSize ) ] } )
+         taskIds.extend( self._saveTopology( [] )[ "taskIds" ] )
+         start += batchSize
+      return taskIds
+
+   def getContainers( self ):
+      '''Get the list of existing containers
+      Returns:
+         containers -- List of information of all containers
+         ( type : List of Dict )
+      '''
+      return self.doRequest( requests.get,
+                                '%s/cvpservice/inventory/containers'
+                                % self.url_ )
+
+
+   def onboardDevices( self, deviceIpAddressesOrHostnames, useBatching=True ):
       '''Onboard devices
 
       Arguments:
@@ -1057,43 +1037,69 @@ class CvpService( object ):
       Returns:
          response body
       '''
-      data = { 'hosts': deviceIpAddressesOrHostnames }
-      return self.doRequest( requests.post,
-                             '%s/cvpservice/inventory/devices' % self.url_,
-                             data=json.dumps( data ) )
+      if useBatching:
+         batchSize = ONBOARD_DEVICE_BATCH_SIZE
+      else:
+         batchSize = len( deviceIpAddressesOrHostnames )
 
-   def bulkAddToInventory( self, deviceToContainerIdMap ):
+      start, end = 0, len( deviceIpAddressesOrHostnames )
+      totalFailed = []
+      while start < end:
+         data = { 'hosts' : deviceIpAddressesOrHostnames[ start : min( end, start+batchSize ) ] }
+         resp = self.doRequest( requests.post,
+                           '%s/cvpservice/inventory/devices' % self.url_,
+                           data=json.dumps( data ) )
+         if 'failed' in resp.get( 'data', {} ):
+            totalFailed.append(resp[ 'data' ][ 'failed' ])
+         start += batchSize
+      # Replicate server response
+      if len(totalFailed) > 0:
+         onboardResponse = { 'data' : { 'failed' : totalFailed } }
+      else:
+         onboardResponse = { 'data' : 'success'}
+
+      return onboardResponse
+
+   def bulkAddToInventory( self, deviceToContainerNameMap ):
       '''Add devices in bulk to the Cvp inventory. Warning -- Method doesn't check the
       existence of the parent container
 
       Arguments:
-         deviceToContainerIdMap -- Map of IP address or host name to
-         containerKey ( type: map[string]string )
+         deviceToContainerNameMap -- Map of IP address or host name to
+         container name ( type: map[string]string )
       Returns:
          taskIDMap -- Map of IP address or host name to the ID of corresponding
          'device add' task ID ( type: map[string]string )
       Raises:
          CvpError -- If parameter data structures are incorrect
       '''
-      deviceIpAddresses = deviceToContainerIdMap.keys()
+      deviceIpAddresses = deviceToContainerNameMap.keys()
       # Onboard the devices
       onboardResp = self.onboardDevices(deviceIpAddresses)
       assert onboardResp["data"] == "success"
       # Wait for device to appear in inventory
-      deviceIDMap = self.waitForDevicesToBeInInventory( deviceIpAddresses )
-      deviceIDToContainerKeyMap = {}
-      for deviceIP, deviceID in deviceIDMap.iteritems():
-         if deviceToContainerIdMap[ deviceIP ] != UNDEF_CONTAINER_KEY:
-            deviceIDToContainerKeyMap[ deviceID ] = deviceToContainerIdMap[ deviceIP ]
+      deviceIPToMacMap = self.waitForDevicesToBeInInventory( deviceIpAddresses )
+      deviceMacToContainerNameMap = {}
+      deviceMacToIPMap = {}
+      for deviceIP, deviceMac in deviceIPToMacMap.iteritems():
+         deviceMacToIPMap[ deviceMac ] = deviceIP
+         containerName = deviceToContainerNameMap[ deviceIP ]
+         if containerName != UNDEF_CONTAINER_NAME:
+            deviceMacToContainerNameMap[ deviceMac ] = containerName
       taskIDMap = {}
-      if not deviceIDToContainerKeyMap:
+      if not deviceMacToContainerNameMap:
          return taskIDMap
-      # Map devices to containers
-      resp = self.mapDevicesToContainers( deviceIDToContainerKeyMap )
-      assert resp[ "result" ] == "success"
-      for ipOrName, deviceId in deviceIDMap.iteritems():
-         if deviceId in resp[ 'deviceTaskMap' ]:
-            taskIDMap[ ipOrName ] = resp[ 'deviceTaskMap' ][ deviceId ]
+      # Move devices to the specified containers using 'addTempAction' followed
+      # by 'saveTopology'
+      taskIdSet = set( self.moveDevicesToContainers(
+          deviceMacToContainerNameMap ) )
+      taskDataList = self.getTasks( 'Pending' )
+      for taskData in taskDataList:
+         taskId = taskData[ "workOrderId" ]
+         if taskId not in taskIdSet:
+            continue
+         deviceMac = taskData[ "data" ][ "NETELEMENT_ID" ]
+         taskIDMap[ deviceMacToIPMap[ deviceMac ] ] = taskId
       return taskIDMap
 
    def saveInventory( self ):
@@ -1203,6 +1209,21 @@ class CvpService( object ):
                self.url_, searchString, startIndex, endIndex ) )
       return snapshotTemplates
 
+   def deleteSnapshotTemplates( self, templateList ):
+      ''' Deletes the snapshot templates with keys provided.
+      Arguments:
+         templateList -- List of snapshot templates to be deleted.
+      '''
+      tList = '['
+      for template in templateList:
+         tList += '"' + template + '",'
+      tList = tList.rstrip( ',' ) + ']'
+
+      deleteResp = self.doRequest( requests.delete,
+                           '%s/cvpservice/snapshot/templates' %(
+                           self.url_ ), data=tList )
+      return deleteResp
+
    def getTemplateInfo(self, key):
       ''' Gets template info of a particular template key.
       Arguments:
@@ -1229,148 +1250,6 @@ class CvpService( object ):
                              '%s/cvpservice/snapshot/templates/info' %(
                               self.url_), data=json.dumps( data ) )
       return templatesInfoResp[ 'templateInfo' ]
-
-   def getTasksForChangeControl( self ):
-      '''Retrieves the list of tasks that could be added to a CCM. These
-      include pending and failed Tasks.
-      Returns:
-         tasks[ 'data' ] -- List of dictionary with task related information,
-         including taskId, taskStatus and ccId( if failed task )
-      '''
-      tasks = self.doRequest( requests.get,
-               '%s/web/changeControl/getTasksByStatus.do?startIndex=%d&endIndex=%d'
-                             % ( self.url_, 0, 0 ) )
-      return tasks[ 'data' ]
-
-
-   def addOrUpdateChangeControl( self, ccId, ccName, snapshotKey,
-                                 taskInfo, schedule=None, countryId=None ):
-      '''Addes or updates a change control to the Cvp Instance
-      Arguments:
-         ccId -- Id associated to an existing CCM
-         ccName -- Name of the change control management
-         snapshotKey -- Snapshot template key for the CCM
-         taskInfo -- List of Dictionary of tasks with their id,
-                     order & snapshotKey
-         schedule -- dateTime of the CCM to be scheduled at
-         stopOnError -- Boolean to indicate if the CCM should stop on error
-      Returns:
-         ccResponse[ 'ccId' ] -- Returns the ccId of the new or the updated CCM
-      '''
-      countryId = '' if not countryId else countryId
-      data = {
-                'ccName' : ccName,
-                'type' : 'Custom',
-                'stopOnError' : 'false',
-                'snapshotTemplateKey' : snapshotKey,
-                'countryId' : countryId,
-                'changeControlTasks' : taskInfo
-      }
-
-      # Making scheduling info = '' so that they sustain the previous schedule
-      # while updating something other than schedule
-      if schedule == None:
-         schedule = { 'dateTime' : '' , 'timeZone' : '' }
-      data.update( schedule )
-
-      # If ccId is set, then its an update API request
-      if ccId != None:
-         data[ 'ccId' ] = ccId
-
-      ccResponse = self.doRequest( requests.post,
-            '%s/web/changeControl/addOrUpdateChangeControl.do' % ( self.url_),
-             data = json.dumps( data ) )
-      return ccResponse[ 'ccId' ]
-
-   def deleteChangeControls( self, ccIds ):
-      ''' Deletes the existing CCMs
-      Arguments:
-        ccIds -- List of the CCMs Ids that need to be deleted
-      '''
-      ccList = [ str( Id ) for Id in ccIds ]
-      data = { 'ccIds' : ccList}
-
-      self.doRequest( requests.post,
-                      '%s/web/changeControl/deleteChangeControls.do' % ( self.url_ ),
-                      data=json.dumps( data ) )
-
-   def executeChangeControl( self, ccIds ):
-      ''' Executes the list of Change Control Managements
-      Arguments:
-         ccIds -- List of ccId in integer
-      '''
-      data = { 'ccIds' : [] }
-      for Id in ccIds:
-         data[ 'ccIds' ].append( { 'ccId' : str( Id ) } )
-
-      self.doRequest( requests.post,
-                     '%s/web/changeControl/executeCC.do' % ( self.url_ ),
-                     data = json.dumps( data ) )
-
-   def cancelChangeControl( self, ccIds ):
-      ''' Cancels scheduled or pending CCMs
-      Arguments:
-         ccIds -- List of the CCMs Ids that need to be canceled
-      '''
-      ccList = [ str( Id ) for Id in ccIds ]
-      data = { 'ccIds' : ccList }
-
-      self.doRequest( requests.post,
-            '%s/web/changeControl/cancelChangeControl.do' % ( self.url_ ),
-            data = json.dumps( data ) )
-
-   def cloneChangeControl( self, ccId ):
-      ''' Clones a Change Control. Only Failed Change Control can be cloned.
-      Only uncloned tasks in pending/failed status from a change control could
-      be cloned.
-      Arguments:
-         ccId -- Change control Id which is to be cloned.
-      Returns:
-         clone -- Dict with information about the change control.
-      '''
-      data = { 'ccIds' : [ str( ccId ) ] }
-      clone = self.doRequest( requests.post,
-               '%s/web/changeControl/cloneChangeControl.do' % ( self.url_ ),
-                     data = json.dumps( data ) )
-      return clone
-
-   def getChangeControlStatus( self, ccId, ccTaskList ):
-      ''' Gets the status and task stats of a Change Control
-      Arguments:
-         ccId -- Id of a change control
-         ccTaskList -- Task associated with change control
-      '''
-      taskList = []
-      for taskInfo in ccTaskList:
-         taskList.append( str( taskInfo.taskId ) )
-      data = {
-         'ccId' : str( ccId ),
-         'taskList' : taskList
-      }
-      ccStatus = self.doRequest( requests.post,
-            '%s/web/changeControl/getCCProgress.do' % ( self.url_ ),
-             data = json.dumps( data ) )
-      return ccStatus[ 'status' ]
-
-   def getChangeControl( self, ccId ):
-      ''' Gets all information regarding the change control
-      Arguments:
-         ccId -- The id of the change control
-      Returns:
-         ccInfo -- All information regarding the change control.
-      '''
-      ccInfo = self.doRequest( requests.get,
-       '%s/web/changeControl/getChangeControlInformation.do?\
-startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
-      return ccInfo
-
-   def getChangeControls( self ):
-      ''' Gets all the change controls from cvp
-      '''
-      return self.doRequest( requests.get,
-                             '%s/web/changeControl/getChangeControls.do?\
-                             queryparam=&startIndex=%d&endIndex=%d'
-                             % ( self.url_, 0, 0 ) )
 
    def _getConfigAndImageRollbackInfo( self, rollbackJsonString, rollbackInfo ):
       ''' Helper function that populates the config and image rollback dicts to
@@ -1462,7 +1341,7 @@ startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
       '''
       ccInfo = self.doRequest( requests.get,
           '%s/web/changeControl/addNetworkRollbackCC.do' % ( self.url_ ) )
-      return int( ccInfo[ 'ccId' ] )
+      return ccInfo[ 'ccId' ]
 
    def executeTask( self, taskId ):
       '''Execute single task in Cvp instance
@@ -1499,17 +1378,20 @@ startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
                      '&isCompletedRequired=%r' % ( self.url_, 0, 0, isCompleted ) )
       return events[ 'data' ]
 
-   def getTasks( self, status=None ):
+   def getTasks( self, status=None, startIndex=0, endIndex=0 ):
       '''Retrieve information about all the tasks in Cvp Instance
       Arguments:
          status -- Filter the results by status
+         startIndex -- Paginate the results and start with this index
+         endIndex -- Paginate the results and end with this index. Pass '0' to
+         get all results
       Returns:
          tasks[ 'data' ] -- List of details of tasks ( type: dict of dict )
       '''
       status = '' if not status else status
       tasks = self.doRequest( requests.get,
                 '%s/web/workflow/getTasks.do?queryparam=%s&startIndex=%d&endIndex=%d'
-                % ( self.url_, status, 0, 0 ) )
+                % ( self.url_, status, startIndex, endIndex ) )
       return tasks[ 'data' ]
 
    def getImageBundles( self ):
@@ -1613,7 +1495,37 @@ startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
       return self.deleteDevices( [ deviceMac ] )
 
    def deleteDevices( self, deviceMacs ):
+      '''Delete the devices from Cvp inventory
+      Arguments:
+         deviceMacs -- List of mac address of the devices
+      Raises:
+         CvpError -- If device(s) mac address is invalid
+                     If parameter data structures are incorrect
+      '''
+      deviceIdList = []
+      devicesInfo, _ = self.getInventory( populateParentContainerKeyMap=False )
+      deviceMacs = map( string.lower, deviceMacs )
+      for device in devicesInfo:
+         if device[ 'systemMacAddress' ] in deviceMacs:
+            deviceIdList.append( device[ 'serialNumber' ] )
+      return self.deleteDevicesById( deviceIdList )
+
+   def deleteDevicesById( self, deviceIds ):
+      '''Delete the devices from cvp inventory
+      Arguments:
+         deviceIds -- List of serial numbers of the devices
+      Raises:
+         CvpError -- If device(s) id is invalid
+                     If parameter data structures are incorrect
+      '''
+      data = { "data" : deviceIds }
+      return self.doRequest( requests.delete,
+                             '%s/cvpservice/inventory/devices' % self.url_,
+                             data=json.dumps( data ) )
+
+   def deleteDevicesDeprecated( self, deviceMacs ):
       '''Delete the devices and its pending tasks from Cvp inventory
+      This method invokes the deprecated deleteDevices.do API
       Arguments:
          deviceMacs -- List of mac address of the devices
       Raises:
@@ -1624,6 +1536,37 @@ startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
       return self.doRequest( requests.post,
                              '%s/cvpservice/inventory/deleteDevices.do' % self.url_,
                              data=json.dumps( data ) )
+
+   def factoryResetDevice( self, containerName, containerKey, deviceFqdn, deviceKey ):
+      '''Factory resets a device. Warning -- Method doesn't check existence of
+      device or container
+
+      Arguments:
+         containerName -- name of the container (type: string)
+         containerKey -- unique key assigned to container (type: string)
+         deviceFqdn -- Fully qualified domain name for device (type: string)
+         deviceKey -- mac address of the device (type: string)
+      Raises:
+         CvpError -- If parameter data structures are incorrect
+      '''
+      data = {
+               "data": [
+                  {
+                     "info": "Device Reset: "+ deviceFqdn + " - To be Reset ",
+                     "infoPreview": "<b>Device Reset:</b> " +  deviceFqdn + " - To be Reset ",
+                     "action": "reset",
+                     "nodeType": "netelement",
+                     "nodeId": deviceKey,
+                     "toId": "undefined_container",
+                     "fromId": containerKey,
+                     "nodeName": deviceFqdn,
+                     "fromName": containerName,
+                     "toIdType": "container"
+                  }
+               ]
+            }
+      self._addTempAction( data )
+      return self._saveTopology( [] )
 
    def applyConfigletToDevice( self, deviceIpAddress, deviceFqdn, deviceMac,
                                cnl, ckl, cbnl, cbkl, createPendingTask=True ):
@@ -2022,9 +1965,15 @@ startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
          raise CvpError( code, errorCodes.ERROR_MAPPING.get( code, '' ),
                          response=cInfo )
       else:
-         for configletInfo in cInfo[ 'data' ]:
-            if 'pythonError' in configletInfo:
+         # preview mode returns a dict in cInfo['data'], assign mode returns a list
+         if mode == 'preview':
+            if 'pythonError' in cInfo[ 'data' ]:
                raise CvpError( errorCodes.CONFIGLET_GENERATION_ERROR,
+                    str( cInfo[ 'data' ][ 'pythonError' ] ), response=cInfo )
+         else:
+            for configletInfo in cInfo[ 'data' ]:
+               if 'pythonError' in configletInfo:
+                  raise CvpError( errorCodes.CONFIGLET_GENERATION_ERROR,
                                str( configletInfo[ 'pythonError' ] ),
                                response=cInfo )
       return cInfo[ 'data' ]
@@ -2236,6 +2185,23 @@ startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
       logs = self.doRequest( requests.get, ( '%s/web/task/getLogsById.do?' +
                         'id=%d&queryparam=%s&startIndex=%d&endIndex=%d' )
                         % ( self.url_, int( taskId ), '', 0, 0 ) )
+      return logs[ 'data' ]
+
+   def getAuditLogsById( self, ccId, stageId=None, dataSize=75 ):
+      '''Returns the audit logs of a particular ChangeControl'''
+      dataJson = {
+                  "category": "ChangeControl",
+                  "startTime": 0,
+                  "endTime": 0,
+                  "dataSize": dataSize,
+                  "objectKey": ccId,
+                  "lastRetrievedAudit": {}
+               }
+      if stageId:
+         dataJson[ "tags" ] = { "stageId": stageId }
+      logs = self.doRequest( requests.post,
+                              '%s/cvpservice/audit/getLogs.do' % self.url_,
+                              data=json.dumps(dataJson))
       return logs[ 'data' ]
 
    def cancelTask( self, taskId ):
@@ -2454,29 +2420,6 @@ startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
             '%s/cvpservice/ztp/getNetElementById.do?netElementId=%s'
             % ( self.url_, macAddress ) )
 
-   def importDeviceByCsv( self, filename, strDirPath='' ):
-      '''Adds a list of devices to inventory
-         Format of the csv file: The first line containing the heading and
-         the next rows the actual values for the devices
-         Return Value: List of information of devices ( Type: List of Dictionary )
-      '''
-      # TODO: Figure out what to do with this API
-      assert isinstance( filename, ( str, unicode ) )
-      filePath = ''
-      if strDirPath:
-         filePath = os.path.join( strDirPath, filename )
-      elif self.tmpDir:
-         filePath = os.path.join( self.tmpDir, filename )
-      elif os.path.isfile( filename ):
-         filePath = filename
-      with open( filePath, 'r' ) as f:
-         resp = self.doRequest( requests.post,
-                             '%s/web/inventory/importInventoryData.do?'
-                                    'startIndex=%d&endIndex=%d'
-                                    % ( self.url_, 0, 0 ),
-                                    files = { 'csvfile' : f } )
-      return resp[ 'tempNetElement' ]
-
    def addAaaServer( self, serverType, status, authMode,
                port, ipAddress, secret, createdDateInLongFormat, accountPort ):
       '''
@@ -2600,7 +2543,7 @@ startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
       type.
       '''
       return self.doRequest( requests.get,
-                             '%s/web/aaa/getAAADetailsById.do?id=aaadetailskey'
+                             '%s/web/aaa/getAAADetailsById.do?id=aaaSettingskey'
                              %  self.url_ )
 
    def getconfigfortask( self, taskId ):
@@ -2608,7 +2551,7 @@ startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
       for the task '''
 
       return self.doRequest( requests.get,
-                     '%s/cvpservice/ztp/v2/getconfigfortask.do?workorderid=%d'
+                     '%s/cvpservice/ztp/v2/getconfigfortask.do?workorderid=%s'
                       %  ( self.url_, taskId ) )
 
    def getEvent( self, eventId ):
@@ -2721,18 +2664,6 @@ startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
       return self.doRequest( requests.post,
                         '%s/cvpservice/ssl/installCertificate.do' % self.url_ )
 
-   def enableDCA( self ):
-      return self.doRequest( requests.post,
-                        '%s/cvpservice/ssl/enableDCA.do' % self.url_ )
-
-   def disableDCA( self ):
-      return self.doRequest( requests.post,
-                        '%s/cvpservice/ssl/disableDCA.do' % self.url_ )
-
-   def isDCAEnabled( self ):
-      return self.doRequest( requests.get,
-                        '%s/cvpservice/ssl/isDCAEnabled.do' % self.url_ )
-
    def installDeviceCertificate( self, isReinstallFlow, devMacs ):
       data = { "isReinstallFlow": isReinstallFlow,
                "netElementIds": devMacs }
@@ -2787,4 +2718,59 @@ startIndex=%d&endIndex=%d&ccId=%d' % ( self.url_, 0, 0, ccId ) )
 
    def sessionIs( self, sessionId ):
       ''' Choose a user session to authenticate with the cvp'''
-      self.cookies = { 'session_id' : sessionId }
+      self.cookies = { 'access_token' : sessionId }
+
+   def queryAeris( self, path ):
+      return self.doRequest( requests.get, '%s/api/v1/rest/%s' % ( self.url_, path ) )
+
+   def updateReenrollDevices( self, reenrollDevices, expiry ):
+      '''Update reenroll devices and expiry'''
+      data = {
+               'devices': reenrollDevices,
+               'expiry': expiry,
+             }
+      return self.doRequest( requests.post,
+            '%s/cvpservice/enroll/reenrollDevices' % self.url_,
+           data=json.dumps( data ) )
+
+   def getReenrollDevices( self, isOnlyValid ):
+      '''Get reenroll devices and expiry'''
+      return self.doRequest( requests.get,
+         '%s/cvpservice/enroll/reenrollDevices?onlyValid=%s' % ( self.url_,
+            isOnlyValid ) )
+
+   def setTerminattrCertEnable( self, enable ):
+      '''Enable or disable the TerminAttr cert setting'''
+      data = { 'enable': enable }
+      return self.doRequest( requests.post,
+            '%s/cvpservice/enroll/terminattrCertEnable' % self.url_,
+            data=json.dumps( data ) )
+
+   def getTerminattrCertEnable( self ):
+      '''Get the Terminattr cert setting'''
+      resp = self.doRequest( requests.get,
+            '%s/cvpservice/enroll/terminattrCertEnable' % self.url_ )
+      return resp[ 'data' ]
+
+   def getLabels( self, label ):
+      '''Retrieves information of all labels.
+      Returns:
+         labels[ 'labels' ] -- List of labels with details
+                               ( type : List of Dict )
+      '''
+      labels = self.doRequest( requests.get,
+               '%s/web/label/getLabels.do?'
+               'module=LABEL&type=ALL&queryparam=%s&startIndex=%d&endIndex=%d'
+               % ( self.url_, label, 0, 0 ) )
+      return labels[ 'labels' ]
+
+   def getLabelDevInfo( self, label ):
+      '''Retrieves information of device to label assignment.
+      Returns:
+         devInfo[ 'data' ] -- List of devices with details
+                              ( type : List of Dict )
+      '''
+      devInfo = self.doRequest( requests.get,
+                '%s/web/label/getAppliedDevicesV2.do?labelId=%s'
+                % ( self.url_, label ) )
+      return devInfo[ 'data' ]
